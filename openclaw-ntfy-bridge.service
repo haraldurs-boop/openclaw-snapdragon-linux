@@ -1,0 +1,22 @@
+[Unit]
+Description=OpenClaw AI Assistant Bridge (ARM64 Low-Power Mode)
+After=network-online.target ntfy.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=openclaw
+Group=openclaw
+WorkingDirectory=/home/openclaw
+EnvironmentFile=/home/openclaw/.openclaw/.env
+CPUAffinity=2 3
+Nice=10
+MemoryMax=128M
+ExecStart=/usr/bin/python3 /home/openclaw/openclaw-ntfy-bridge.py
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

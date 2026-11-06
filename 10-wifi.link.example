@@ -1,0 +1,6 @@
+[Match]
+Driver=ath11k_pci
+
+[Link]
+Name=wlan0
+MACAddress=00:03:7f:12:xx:xx

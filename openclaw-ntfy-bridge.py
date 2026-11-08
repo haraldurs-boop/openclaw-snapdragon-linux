@@ -5,12 +5,14 @@ Architecture & Loop Engine enhanced based on Gemini 4 Argon analysis:
 - Guaranteed Final Synthesis: disables tools on final step to force answer summarization.
 - Deduplication Guard: tracks seen tool calls to prevent repetitive execution loops.
 - tool_inspect_lan_host: unified network inspector (DNS, ARP neighbours, ping).
+- tool_wake_device: multi-stage wake-up engine (WoL Magic Packet + Wi-Fi DTIM Unicast burst).
 """
 import base64
 import glob
 import json
 import os
 import re
+import socket
 import subprocess
 import threading
 import time
@@ -50,8 +52,9 @@ def load_workspace_prompt() -> str:
         "Keep answers concise, actionable, and formatted cleanly for mobile messaging screens.",
         "\nTOOL USE & NETWORK RULES:",
         "- Use tools conservatively (maximum 3-4 calls per query).",
-        "- For local network queries (.local domains or IP devices), ALWAYS use `tool_inspect_lan_host` instead of guessing shell commands.",
-        "- If a lookup or ping returns no match, do NOT retry multiple alternative shell commands. Use available ARP/network data to explain status directly to the user.",
+        "- For local network inspection, use `tool_inspect_lan_host`.",
+        "- To attempt waking a sleeping device or tablet, use `tool_wake_device` (sends WoL + Wi-Fi DTIM wake bursts).",
+        "- Explain results clearly: whether the target woke up and responded to ping, or remains unreachable (sleeping, powered off, or off-network).",
     ]
     for name in ("SOUL.md", "IDENTITY.md", "USER.md", "MEMORY.md"):
         p = os.path.join(WORKSPACE_DIR, name)
@@ -114,7 +117,7 @@ def tool_inspect_lan_host(target: str = "") -> str:
             out = subprocess.run(["getent", "hosts", target], capture_output=True, text=True, timeout=3).stdout
             for line in out.splitlines():
                 parts = line.split()
-                if parts:
+                if parts and parts[0] not in res["resolved_ips"]:
                     res["resolved_ips"].append(parts[0])
         except Exception:
             pass
@@ -151,6 +154,86 @@ def tool_inspect_lan_host(target: str = "") -> str:
             pass
 
     return json.dumps(res, ensure_ascii=False, indent=2)
+
+
+def tool_wake_device(target: str = "taba.local") -> str:
+    """Sends multi-stage wake-up packets (WoL Magic Packet + Wi-Fi DTIM Unicast burst)."""
+    target = (target or "taba.local").strip()
+    report = {"target": target, "actions": [], "woke_up": False, "target_ip": None, "mac": None}
+
+    target_ip = None
+    if re.match(r"^\d+\.\d+\.\d+\.\d+$", target):
+        target_ip = target
+    else:
+        try:
+            out = subprocess.run(["getent", "hosts", target], capture_output=True, text=True, timeout=3).stdout
+            for line in out.splitlines():
+                parts = line.split()
+                if parts:
+                    target_ip = parts[0]
+                    break
+        except Exception:
+            pass
+
+    report["target_ip"] = target_ip
+
+    found_mac = None
+    try:
+        neigh_out = subprocess.run(["ip", "neigh", "show"], capture_output=True, text=True, timeout=3).stdout
+        for line in neigh_out.splitlines():
+            parts = line.split()
+            if len(parts) >= 5 and parts[3] == "lladdr":
+                if target_ip and parts[0] == target_ip:
+                    found_mac = parts[4]
+                    break
+    except Exception:
+        pass
+
+    report["mac"] = found_mac
+
+    # Stage A: Send WoL Magic Packet to broadcast
+    try:
+        mac_to_use = found_mac or "1a:af:e7:49:41:25"
+        mac_bytes = bytes.fromhex(mac_to_use.replace(":", "").replace("-", ""))
+        pkt = b"\xff" * 6 + mac_bytes * 16
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            s.sendto(pkt, ("192.168.68.255", 9))
+            s.sendto(pkt, ("192.168.68.255", 7))
+        report["actions"].append(f"WoL Magic Packet sent to broadcast for MAC {mac_to_use}.")
+    except Exception as e:
+        report["actions"].append(f"WoL error: {e}")
+
+    # Stage B: Unicast Wi-Fi DTIM / Power-Save wake burst
+    if target_ip:
+        try:
+            probe_ports = [22, 80, 5353, 9, 8080]
+            for p in probe_ports:
+                try:
+                    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                        s.settimeout(0.2)
+                        s.sendto(b"WAKEUP_PROBE", (target_ip, p))
+                except Exception:
+                    pass
+            for p in [22, 80]:
+                try:
+                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    s.settimeout(0.25)
+                    s.connect_ex((target_ip, p))
+                    s.close()
+                except Exception:
+                    pass
+            report["actions"].append(f"Unicast Wi-Fi DTIM wake-burst sent to {target_ip} (ports {probe_ports}).")
+        except Exception as e:
+            report["actions"].append(f"DTIM burst error: {e}")
+
+    # Stage C: Verification probe
+    time.sleep(1.2)
+    if target_ip:
+        p = subprocess.run(["ping", "-c", "1", "-W", "2", target_ip], capture_output=True, text=True)
+        report["woke_up"] = (p.returncode == 0)
+
+    return json.dumps(report, ensure_ascii=False, indent=2)
 
 
 def tool_read_workspace_file(filename: str) -> str:
@@ -203,6 +286,14 @@ TOOLS_DECLARATION = [
         },
     },
     {
+        "name": "tool_wake_device",
+        "description": "Attempt to wake a network device or tablet (e.g. taba.local) using WoL and Wi-Fi DTIM wake bursts.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {"target": {"type": "STRING", "description": "Hostname or IP address to wake."}},
+        },
+    },
+    {
         "name": "tool_read_workspace_file",
         "description": "Read a file from workspace (SOUL.md, IDENTITY.md, USER.md, MEMORY.md).",
         "parameters": {
@@ -240,6 +331,8 @@ def execute_tool_call(name: str, args: dict) -> str:
         return tool_get_r8q_status()
     elif name == "tool_inspect_lan_host":
         return tool_inspect_lan_host(args.get("target", ""))
+    elif name == "tool_wake_device":
+        return tool_wake_device(args.get("target", "taba.local"))
     elif name == "tool_read_workspace_file":
         return tool_read_workspace_file(args.get("filename", ""))
     elif name == "tool_write_workspace_file":
@@ -441,7 +534,7 @@ def hardware_watchdog_loop() -> None:
 
 
 def listen_loop() -> None:
-    print("[openclaw-ntfy-bridge] Starting OpenClaw ntfy bridge v3...", flush=True)
+    print("[openclaw-ntfy-bridge] Starting OpenClaw ntfy bridge v4...", flush=True)
     t = threading.Thread(target=hardware_watchdog_loop, daemon=True)
     t.start()
 

@@ -85,11 +85,16 @@ This repository provides the complete post-mortem, system tuning rules, and a li
   MACAddress=00:03:7f:12:xx:xx
   ```
 
-### D. Multi-Tier Model Cascades
-* **The Problem:** Free-tier or preview models (e.g. `gemini-3.8-flash`) can encounter transient 503 capacity spikes or regional quotas.
-* **The Mitigation:** The bridge implements automatic fallback:  
-  `gemini-3.8-flash` ➔ `gemini-3.6-flash` ➔ `gemini-3.5-flash` ➔ `gemini-2.5-flash`.  
-  If a higher-tier model is throttled, requests transparently resolve on the active tier within milliseconds.
+### D. 3-Tier Zero-Cost LLM Fallback & Privacy-Preserving Prompt-Relay
+* **The Problem:** Free-tier API rate limits (HTTP 429 quota exhaustion) on Google AI Studio can stall agent workflows during peak activity. Paying for enterprise API access or recurring subscriptions is often undesirable for a self-hosted personal server.
+* **The Mitigation:** The bridge implements a zero-cost 3-tier resilient cascade:
+  1. **Primary (Google Gemini):** Multi-tier cascade across Gemini models (`gemini-3.8-flash` ➔ `gemini-3.6-flash` ➔ `gemini-3.5-flash` ➔ `gemini-2.5-flash`).
+  2. **Fallback 1 (Groq Cloud API):** If Gemini exhausts quotas (HTTP 429), the bridge seamlessly pivots to Groq's free `llama-3.3-70b-versatile` API using lightweight OpenAI-compatible function calling (0 MB RAM overhead).
+  3. **Fallback 2 (Human-in-the-Loop Prompt-Relay):** If both APIs are throttled, OpenClaw pre-fetches local system and network diagnostics (battery, uptime, ARP table, Uptime Kuma), runs them through a strict two-way **Sanitization Engine** (stripping all real IPs, MACs, tailnet hostnames, and secret tokens), and posts a copy-pasteable Markdown package directly to `ntfy`. The user can copy the prompt into any free web LLM (ChatGPT, Claude, Grok, Meta AI) and reply on `ntfy` (`Svar: ...`). OpenClaw decodes the tokenized entities and saves the response to persistent session memory.
+
+### E. Public Tailscale Funnel Action Buttons
+* **The Problem:** Interactive notifications with HTTP Action buttons (`Actions: http, ...`) fail when constructed with loopback URLs (`http://127.0.0.1:2586`) because mobile clients cannot resolve `127.0.0.1` back to the server.
+* **The Mitigation:** Action buttons are dynamically routed through the server's public Tailscale Funnel endpoint (`PUBLIC_NTFY_URL`), allowing one-tap system triage and update triggers from Pixel/mobile devices on home Wi-Fi and 4G/5G LTE alike.
 
 ---
 

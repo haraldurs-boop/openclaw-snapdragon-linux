@@ -1,0 +1,1 @@
+openclaw ALL=(ALL) NOPASSWD: /usr/bin/systemctl start llama-server.service, /usr/bin/systemctl stop llama-server.service, /usr/bin/systemctl is-active llama-server.service, /usr/bin/systemctl status llama-server.service

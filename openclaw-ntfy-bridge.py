@@ -984,9 +984,10 @@ def ask_openclaw(prompt: str, env: dict) -> tuple[str, str]:
             # 3. Ef bæði bregðast: Reyna Local Llama (ef í næturglugga 23:30 - 07:10)
             if res is None and is_night_window():
                 try:
-                    print("[openclaw-bridge] Reyni Local Llama (næturgluggi)...", flush=True)
-                    res_llama, used_model = call_local_llama(contents, system_prompt)
-                    llama_text = "🌙 (staðvært líkan, enska)\n" + res_llama.get("text", "")
+                    print("[openclaw-bridge] Reyni Local Llama on-demand (næturgluggi)...", flush=True)
+                    progress_fn = lambda msg: post_ntfy(msg, env, title="⏳ OpenClaw", tags="hourglass_flowing_sand")
+                    res_llama, used_model = call_local_llama(contents, system_prompt, progress_cb=progress_fn)
+                    llama_text = "🌙 [staðvært líkan, takmarkað]\n" + res_llama.get("text", "")
                     new_hist = list(history) + [
                         {"role": "user", "parts": [{"text": text}]},
                         {"role": "model", "parts": [{"text": llama_text}]},

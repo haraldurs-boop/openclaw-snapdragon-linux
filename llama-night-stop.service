@@ -1,0 +1,6 @@
+[Unit]
+Description=Safety stop for Llama Server at end of night window (07:10)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl stop llama-server.service

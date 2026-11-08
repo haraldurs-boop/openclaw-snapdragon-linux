@@ -1,0 +1,28 @@
+[Unit]
+Description=Llama.cpp Lightweight On-Demand Server for OpenClaw (r8q)
+After=network.target
+ConditionPathExists=/opt/models/qwen2.5-1.5b-instruct-q4_0.gguf
+
+[Service]
+Type=simple
+User=root
+ExecStartPre=/usr/local/bin/temp-ok.sh
+ExecStart=/opt/llama-b12206/llama-server \
+  -m /opt/models/qwen2.5-1.5b-instruct-q4_0.gguf \
+  --host 127.0.0.1 \
+  --port 8081 \
+  -c 4096 \
+  -np 1 \
+  -t 2 \
+  -tb 2 \
+  --poll 0 \
+  --no-webui
+Restart=no
+CPUAffinity=0 1
+Nice=19
+MemoryMax=2.5G
+OOMScoreAdjust=900
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

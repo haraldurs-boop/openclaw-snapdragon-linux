@@ -1,0 +1,9 @@
+[Unit]
+Description=Timer to ensure Llama Server is stopped at 07:10 every morning
+
+[Timer]
+OnCalendar=*-*-* 07:10:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

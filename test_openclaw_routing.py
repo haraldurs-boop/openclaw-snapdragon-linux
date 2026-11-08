@@ -61,16 +61,10 @@ for q in ["staða", "er taba uppi", "vekja taba", "vaktir", "uppfærslur"]:
     fp._last_wake = 0.0
     r = fp.try_fast_path(q)
     check(f"render {q!r} < 50ms", r is not None and r.elapsed_ms < 50, f"{r and r.elapsed_ms:.1f}ms")
-    print("     " + r.text.replace("\n", "\n     "))
 r = fp.try_fast_path("staða")
 check("ekkert MAC/IP lekið", "aa:bb" not in r.text and "1.2.3.4" not in r.text)
 check("wake cooldown", (fp.try_fast_path("vekja taba"), fp.try_fast_path("vekja taba"))[1].text.startswith("⏳"))
 check("None fyrir LLM-fyrirspurn", fp.try_fast_path("af hverju er síminn heitur") is None)
-n = 2000
-t = time.perf_counter()
-for _ in range(n):
-    fp.classify("hvernig líður símanum")
-print(f"     classify: {(time.perf_counter() - t) / n * 1e6:.0f} µs/kall á þessari vél")
 
 # ---------------------------------------------------------------- night window
 D = lambda h, m: datetime(2026, 11, 8, h, m)
@@ -79,8 +73,28 @@ for (h, m), exp in {(23, 29): False, (23, 30): True, (0, 0): True, (7, 9): True,
 check("seconds_left 07:00 = 600", ll.seconds_left_in_window(D(7, 0)) == 600)
 check("seconds_left 23:30 = 7h40m", ll.seconds_left_in_window(D(23, 30)) == 7 * 3600 + 40 * 60)
 
-# ---------------------------------------------------------------- local llama gegn fölskum server
+# ---------------------------------------------------------------- local llama gegn fölskum server & manager
 SEEN = {}
+SYSTEMCTL_COMMANDS = []
+
+def fake_subprocess_run(cmd, *a, **kw):
+    SYSTEMCTL_COMMANDS.append(" ".join(cmd))
+    res = type("Result", (), {})()
+    res.returncode = 0
+    res.stderr = ""
+    return res
+
+ll.subprocess.run = fake_subprocess_run
+
+# ---------------------------------------------------------------- action guard check
+act_query = [{"role": "user", "parts": [{"text": "geturðu endurræst símann fyrir mig?"}]}]
+ll._now = lambda: D(2, 0)
+ll._battery_temp_c = lambda: 33.0
+try:
+    ll.call_local_llama(act_query, "x"); ok = False
+except ll.LocalLlamaUnavailable as e:
+    ok = e.reason == "action_requires_human_or_tools"
+check("aðgerðafyrirspurn hafnar staðværu líkani (=> Human Relay)", ok)
 
 
 class Fake(BaseHTTPRequestHandler):
@@ -106,6 +120,20 @@ ll.LLAMA_BASE_URL = f"http://127.0.0.1:{srv.server_port}"
 contents = [{"role": "user", "parts": [{"text": "hvernig er rafhlaðan að standa sig?"}]},
             {"role": "user", "parts": [{"functionResponse": {"name": "x"}}]}]
 
+# Fake subprocess.run fyrir manager
+orig_run = ll.subprocess.run
+
+
+def fake_subprocess_run(cmd, *a, **kw):
+    SYSTEMCTL_COMMANDS.append(" ".join(cmd))
+    res = type("Result", (), {})()
+    res.returncode = 0
+    res.stderr = ""
+    return res
+
+
+ll.subprocess.run = fake_subprocess_run
+
 ll._now = lambda: D(14, 0)
 try:
     ll.call_local_llama(contents, "x"); ok = False
@@ -129,7 +157,8 @@ except ll.LocalLlamaUnavailable as e:
 check("heitur sími => Relay", ok)
 
 ll._battery_temp_c = lambda: 33.0
-res, label = ll.call_local_llama(contents, "x")
+progress_messages = []
+res, label = ll.call_local_llama(contents, "x", progress_cb=lambda m: progress_messages.append(m))
 body = SEEN["body"]
 check("engin tools í payload", "tools" not in body and "tool_choice" not in body)
 check("max_tokens == 250", body["max_tokens"] == 250)
@@ -137,13 +166,19 @@ check("enskt prompt + íslensk spurning", "Provide a concise 2-3 sentence answer
       and "rafhlaðan" in body["messages"][1]["content"])
 check("trimmað að setningamörkum", res["text"] == "Battery is fine. Second sentence.", res["text"])
 check("label", label.startswith("local-llama:"))
+check("idle timer virkjaður", ll._manager._idle_timer is not None)
+
+# Prófa idle stop
+ll._manager.stop_service()
+check("systemctl stop kallað við idle/stop", any("systemctl stop llama-server.service" in c for c in SYSTEMCTL_COMMANDS))
 
 srv.shutdown(); srv.server_close()
+ll.STARTUP_TIMEOUT_S = 1
 try:
     ll.call_local_llama(contents, "x"); ok = False
 except ll.LocalLlamaUnavailable as e:
-    ok = e.reason.startswith("server_down")
-check("server niðri => Relay", ok)
+    ok = "startup_timeout" in e.reason or "request_failed" in e.reason
+check("server sem svarar ekki gefur strax Relay", ok)
 
 print("\nALLT Í LAGI" if not FAIL else f"\n{FAIL} PRÓF FÖLLUÐU")
 raise SystemExit(1 if FAIL else 0)

@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """
-OpenClaw - Þrep 3: Cold-Run Local Llama Fallback (llama-server á 127.0.0.1:8081).
+OpenClaw - Þrep 3: On-Demand Local Llama Fallback (llama-server á 127.0.0.1:8081).
 
-Reglur (úr verkefnislýsingu):
-  - Aðeins milli 23:30 og 07:10 (staðartími símans).
-  - Enska til líkansins, engin tól (tools er ALDREI sent), max_tokens=250, timeout=240s.
+Hannað í samvinnu við Claude Sonnet:
+  - Keyrir aðeins milli 23:30 og 07:10 (staðartími r8q símans).
+  - On-Demand: ræsir llama-server.service gegnum systemd aðeins þegar þörf krefur (0 MB RAM í lausagangi).
+  - Sjálfvirk slökkvun: slekkur á llama-server.service eftir 10 mínútna lausagang (idleStop).
+  - Öryggisstöðvun: llama-night-stop.timer slekkur á þjónustunni óháð öllu kl. 07:10.
+  - Aðgerðasía: ef fyrirspurn krefst aðgerða (breyta, vekja, uppfæra, keyra) er hafnað strax => Human Relay.
+  - Enska til líkansins, engin tól (tools er ALDREI sent), max_tokens=250, timeout=120s.
   - Hvers kyns bilun => LocalLlamaUnavailable => kallandi fer í Human Relay (Þrep 4).
-
-Viðbótarvarnir (ódýrar og koma í veg fyrir bið í 4 mín. í von og vísa):
-  - Gluggi að lokast: ekki hefja beiðni ef < MIN_REMAINING_S sek. eru eftir af glugganum.
-  - Hitavörn: ef rafhlöðuhiti >= THERMAL_LIMIT_C er beðið um Human Relay í stað þess að hita símann.
-  - /health forprófun (2 s): server niðri eða enn að hlaða líkan => strax í Relay.
 """
 from __future__ import annotations
 
@@ -18,19 +17,23 @@ import glob
 import json
 import re
 import socket
+import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
 from datetime import datetime, time as dtime, timedelta
-from typing import Optional
+from typing import Callable, Optional
 
 LLAMA_BASE_URL = "http://127.0.0.1:8081"
 NIGHT_START = dtime(23, 30)
 NIGHT_END = dtime(7, 10)
 MIN_REMAINING_S = 90
-THERMAL_LIMIT_C = 41.0
+THERMAL_LIMIT_C = 40.0
 MAX_TOKENS = 250
-TIMEOUT_S = 240
+TIMEOUT_S = 120
+STARTUP_TIMEOUT_S = 25
+IDLE_STOP_S = 600  # 10 mínútur
 MAX_QUERY_CHARS = 400
 MODEL_LABEL = "qwen2.5-1.5b"
 
@@ -39,6 +42,15 @@ LOCAL_SYSTEM_PROMPT = (
     "The user writes in Icelandic. Reply in English, at most 3 short sentences. "
     "You have no tools and no access to live device data: never invent numbers, "
     "statuses or file contents. If you cannot answer reliably, say so briefly."
+)
+
+# Orð sem gefa til kynna að fyrirspurn krefjist aðgerðar/breytinga (sem 1.5B líkan má ALDREI gera)
+ACTION_WORDS = (
+    "vekja", "vaktu", "kveikja", "kveiktu", "slökkva", "slökktu",
+    "endurræsa", "endurræstu", "endurræst", "uppfæra", "uppfærðu",
+    "breyta", "breyttu", "skrifa", "skrifaðu", "eyða", "eyddu",
+    "keyra", "keyrðu", "senda", "sendu", "bæta við",
+    "install", "update", "reboot", "restart", "wake"
 )
 
 
@@ -50,13 +62,13 @@ class LocalLlamaUnavailable(RuntimeError):
         self.reason = reason
 
 
-def _now() -> datetime:                      # sér fall svo hægt sé að stubba í prófum
+def _now() -> datetime:
     return datetime.now()
 
 
 def is_night_window(now: Optional[datetime] = None) -> bool:
     t = (now or _now()).time()
-    return t >= NIGHT_START or t < NIGHT_END   # glugginn vefst yfir miðnætti
+    return t >= NIGHT_START or t < NIGHT_END
 
 
 def seconds_left_in_window(now: Optional[datetime] = None) -> float:
@@ -68,10 +80,11 @@ def seconds_left_in_window(now: Optional[datetime] = None) -> float:
 
 
 def _battery_temp_c() -> Optional[float]:
-    for path in glob.glob("/sys/class/power_supply/*battery*/temp") + glob.glob("/sys/class/power_supply/*/temp"):
+    for path in glob.glob("/sys/class/thermal/thermal_zone25/temp") + glob.glob("/sys/class/power_supply/*battery*/temp"):
         try:
             with open(path) as f:
-                return int(f.read().strip()) / 10.0
+                val = int(f.read().strip())
+                return val / 1000.0 if val > 1000 else val / 10.0
         except (OSError, ValueError):
             continue
     return None
@@ -88,7 +101,7 @@ def _last_user_text(contents) -> str:
             c = item.get("content", "")
             txt = c if isinstance(c, str) else " ".join(
                 p.get("text", "") for p in c if isinstance(p, dict))
-        if txt.strip():                        # sleppir functionResponse-hlutum (enginn texti)
+        if txt.strip():
             return txt.strip()
     return ""
 
@@ -103,25 +116,107 @@ def _http_json(path: str, payload: Optional[dict] = None, timeout: float = 5) ->
         return json.loads(r.read().decode("utf-8"))
 
 
+def _is_server_healthy() -> bool:
+    try:
+        data = _http_json("/health", timeout=1.5)
+        return data.get("status") == "ok"
+    except Exception:
+        return False
+
+
 def _trim_to_sentence(text: str) -> str:
     m = re.search(r"^(.*[.!?])\s", text + " ", re.S)
     return m.group(1) if m else text
 
 
-def call_local_llama(contents: list, system_prompt: str = "") -> tuple[dict, str]:
+class LlamaLifecycleManager:
+    """
+    Stjórnar lífsferli llama-server.service:
+      - Thread-safe gangsetning og bið.
+      - Sjálfvirk stöðvun eftir 10 mínútna aðgerðaleysi.
+    """
+
+    def __init__(self, idle_seconds: int = IDLE_STOP_S):
+        self.idle_seconds = idle_seconds
+        self._lock = threading.Lock()
+        self._idle_timer: Optional[threading.Timer] = None
+
+    def _cancel_idle_timer(self) -> None:
+        if self._idle_timer is not None:
+            self._idle_timer.cancel()
+            self._idle_timer = None
+
+    def schedule_idle_stop(self) -> None:
+        with self._lock:
+            self._cancel_idle_timer()
+            self._idle_timer = threading.Timer(self.idle_seconds, self.stop_service)
+            self._idle_timer.daemon = True
+            self._idle_timer.start()
+
+    def stop_service(self) -> None:
+        with self._lock:
+            self._cancel_idle_timer()
+            try:
+                subprocess.run(["sudo", "-n", "/usr/bin/systemctl", "stop", "llama-server.service"],
+                               check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                pass
+
+    def ensure_running(self, progress_cb: Optional[Callable[[str], None]] = None) -> None:
+        """
+        Gengur úr skugga um að llama-server sé í gangi og svari /health.
+        Ef niðri: ræsir gegnum systemd og bíður þar til tilbúið (eða timeout).
+        """
+        with self._lock:
+            self._cancel_idle_timer()
+            if _is_server_healthy():
+                return
+
+            if progress_cb:
+                try:
+                    progress_cb("⏳ Ræsi staðbundið líkan (tekur ~7 sek)...")
+                except Exception:
+                    pass
+
+            # Ræsa þjónustuna gegnum sudoers
+            res = subprocess.run(
+                ["sudo", "-n", "/usr/bin/systemctl", "start", "llama-server.service"],
+                capture_output=True, text=True
+            )
+            if res.returncode != 0:
+                raise LocalLlamaUnavailable(f"systemd_start_failed:{res.stderr.strip()[:60]}")
+
+            # Bíða eftir að /health gefi grænt ljós
+            t0 = time.monotonic()
+            while time.monotonic() - t0 < STARTUP_TIMEOUT_S:
+                time.sleep(0.5)
+                if _is_server_healthy():
+                    return
+
+            # Ef ekki kominn upp innan tímamarka: stöðva og falla í Relay
+            subprocess.run(["sudo", "-n", "/usr/bin/systemctl", "stop", "llama-server.service"],
+                           check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            raise LocalLlamaUnavailable("startup_timeout")
+
+
+_manager = LlamaLifecycleManager()
+
+
+def call_local_llama(contents: list, system_prompt: str = "",
+                     progress_cb: Optional[Callable[[str], None]] = None) -> tuple[dict, str]:
     """
     Skilar (result, provider_label).
       result = {"text", "finish_reason", "tool_calls": [], "usage", "latency_s"}
     `system_prompt` er haldið í undirskriftinni til samræmis við hin þrepin en er
-    VÍSVITANDI ekki notað: kerfisskipunin fyrir skýin er löng, íslensk og full af
-    tóla-lýsingum og myndi sprengja samhengisgluggann hjá 1.5B líkaninu.
-    Kastar LocalLlamaUnavailable í öllum bilunartilvikum.
+    ekki notað (notum stuttan LOCAL_SYSTEM_PROMPT).
+    Kastar LocalLlamaUnavailable í öllum bilunartilvikum => kallandi fer í Human Relay.
     """
     now = _now()
     if not is_night_window(now):
         raise LocalLlamaUnavailable("outside_night_window")
     if seconds_left_in_window(now) < MIN_REMAINING_S:
         raise LocalLlamaUnavailable("window_closing")
+
     temp = _battery_temp_c()
     if temp is not None and temp >= THERMAL_LIMIT_C:
         raise LocalLlamaUnavailable(f"thermal_guard_{temp:.1f}C")
@@ -130,13 +225,15 @@ def call_local_llama(contents: list, system_prompt: str = "") -> tuple[dict, str
     if not query:
         raise LocalLlamaUnavailable("empty_query")
 
-    try:
-        _http_json("/health", timeout=2)
-    except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError, OSError,
-            json.JSONDecodeError) as e:
-        raise LocalLlamaUnavailable(f"server_down:{type(e).__name__}") from e
+    # Aðgerðasía: 1.5B líkanið á ALDREI að þykjast geta breytt eða framkvæmt aðgerðir
+    q_lower = query.lower()
+    if any(w in q_lower for w in ACTION_WORDS):
+        raise LocalLlamaUnavailable("action_requires_human_or_tools")
 
-    payload = {                                  # ATH: engin "tools" / "tool_choice" lyklar
+    # Ræsa vélina on-demand ef þörf krefur
+    _manager.ensure_running(progress_cb=progress_cb)
+
+    payload = {
         "model": "local",
         "messages": [
             {"role": "system", "content": LOCAL_SYSTEM_PROMPT},
@@ -146,8 +243,8 @@ def call_local_llama(contents: list, system_prompt: str = "") -> tuple[dict, str
         "max_tokens": MAX_TOKENS,
         "temperature": 0.3,
         "top_p": 0.9,
-        "repeat_penalty": 1.15,                  # llama.cpp viðbót: gegn endurtekningalykkjum
-        "cache_prompt": True,                    # llama.cpp viðbót: endurnýtir kerfisskipun
+        "repeat_penalty": 1.15,
+        "cache_prompt": True,
         "stream": False,
     }
     t0 = time.monotonic()
@@ -157,13 +254,19 @@ def call_local_llama(contents: list, system_prompt: str = "") -> tuple[dict, str
         text = (choice["message"]["content"] or "").strip()
     except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError, OSError,
             json.JSONDecodeError, KeyError, IndexError, TypeError) as e:
+        _manager.schedule_idle_stop()
         raise LocalLlamaUnavailable(f"request_failed:{type(e).__name__}") from e
+
+    # Endurstilla 10 mínútna sjálfvirkan slökkvara eftir hverja heppnaða fyrirspurn
+    _manager.schedule_idle_stop()
+
     if not text:
         raise LocalLlamaUnavailable("empty_response")
 
     finish = choice.get("finish_reason")
     if finish == "length":
         text = _trim_to_sentence(text)
+
     result = {
         "text": text,
         "finish_reason": finish,

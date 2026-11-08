@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """
 Lightweight, resilient OpenClaw + ntfy bidirectional bridge for ARM64 Linux phones.
-Runs using < 15 MB RAM and 0.0% idle CPU (avoids Node.js V8 RCU stalls on 0-swap devices).
-Syncs with OpenClaw workspace markdown files and exposes hardware telemetry tool calls.
+Architecture & Loop Engine enhanced based on Gemini 4 Argon analysis:
+- Guaranteed Final Synthesis: disables tools on final step to force answer summarization.
+- Deduplication Guard: tracks seen tool calls to prevent repetitive execution loops.
+- tool_inspect_lan_host: unified network inspector (DNS, ARP neighbours, ping).
 """
 import base64
 import glob
 import json
 import os
+import re
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -24,6 +28,8 @@ MODELS = [
     "gemini-3.5-flash",
     "gemini-2.5-flash",
 ]
+
+MAX_TOOL_ROUNDS = 4
 
 
 def load_env() -> dict:
@@ -42,6 +48,10 @@ def load_workspace_prompt() -> str:
     parts = [
         "You are OpenClaw, a personal AI assistant running locally on an ARM64 Linux phone.",
         "Keep answers concise, actionable, and formatted cleanly for mobile messaging screens.",
+        "\nTOOL USE & NETWORK RULES:",
+        "- Use tools conservatively (maximum 3-4 calls per query).",
+        "- For local network queries (.local domains or IP devices), ALWAYS use `tool_inspect_lan_host` instead of guessing shell commands.",
+        "- If a lookup or ping returns no match, do NOT retry multiple alternative shell commands. Use available ARP/network data to explain status directly to the user.",
     ]
     for name in ("SOUL.md", "IDENTITY.md", "USER.md", "MEMORY.md"):
         p = os.path.join(WORKSPACE_DIR, name)
@@ -57,9 +67,14 @@ def load_workspace_prompt() -> str:
 
 
 def tool_get_r8q_status() -> str:
-    """Collects real-time phone telemetry: battery, voltage, temp, uptime, memory, disk, services."""
+    """Collects real-time phone telemetry: battery, power source, temp, uptime, memory, disk, services."""
     info = {}
     try:
+        charger_online = "0"
+        for p in glob.glob("/sys/class/power_supply/*charger*/online"):
+            charger_online = open(p).read().strip()
+        info["power_source"] = "AC / Charger" if charger_online == "1" else "Battery (Discharging)"
+
         for p in glob.glob("/sys/class/power_supply/*battery*/capacity"):
             info["battery_percent"] = open(p).read().strip() + "%"
         for p in glob.glob("/sys/class/power_supply/*battery*/voltage_now"):
@@ -89,8 +104,56 @@ def tool_get_r8q_status() -> str:
     return json.dumps(info, ensure_ascii=False, indent=2)
 
 
+def tool_inspect_lan_host(target: str = "") -> str:
+    """Unified LAN inspection: DNS/mDNS lookup, ARP neighbour cache, and ping."""
+    target = (target or "").strip()
+    res = {"target": target, "resolved_ips": [], "arp_matches": [], "ping_ok": False}
+
+    if target:
+        try:
+            out = subprocess.run(["getent", "hosts", target], capture_output=True, text=True, timeout=3).stdout
+            for line in out.splitlines():
+                parts = line.split()
+                if parts:
+                    res["resolved_ips"].append(parts[0])
+        except Exception:
+            pass
+
+    try:
+        neigh_out = subprocess.run(["ip", "neigh", "show"], capture_output=True, text=True, timeout=3).stdout
+        for line in neigh_out.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split()
+            ip = parts[0]
+            mac = parts[4] if len(parts) >= 5 and parts[3] == "lladdr" else "unknown"
+            state = parts[-1]
+            if target and (target in ip or target.lower() in line.lower()):
+                res["arp_matches"].append({"ip": ip, "mac": mac, "state": state})
+            elif not target:
+                res["arp_matches"].append({"ip": ip, "mac": mac, "state": state})
+
+        if not res["arp_matches"] and target:
+            for line in neigh_out.splitlines()[:12]:
+                parts = line.split()
+                if parts and len(parts) >= 5:
+                    res["arp_matches"].append({"ip": parts[0], "mac": parts[4], "state": parts[-1]})
+    except Exception as e:
+        res["arp_error"] = str(e)
+
+    ping_target = res["resolved_ips"][0] if res["resolved_ips"] else (target if re.match(r"^\d+\.\d+\.\d+\.\d+$", target) else None)
+    if ping_target:
+        try:
+            p = subprocess.run(["ping", "-c", "1", "-W", "2", ping_target], capture_output=True, text=True, timeout=4)
+            res["ping_ok"] = (p.returncode == 0)
+        except Exception:
+            pass
+
+    return json.dumps(res, ensure_ascii=False, indent=2)
+
+
 def tool_read_workspace_file(filename: str) -> str:
-    """Reads a file from OpenClaw workspace directory."""
     safe_name = os.path.basename(filename)
     path = os.path.join(WORKSPACE_DIR, safe_name)
     if not os.path.exists(path):
@@ -100,7 +163,6 @@ def tool_read_workspace_file(filename: str) -> str:
 
 
 def tool_write_workspace_file(filename: str, content: str) -> str:
-    """Writes or updates a markdown file in OpenClaw workspace."""
     safe_name = os.path.basename(filename)
     if not safe_name.endswith(".md"):
         return "Only .md files are allowed in workspace."
@@ -111,7 +173,6 @@ def tool_write_workspace_file(filename: str, content: str) -> str:
 
 
 def tool_run_shell_command(command: str) -> str:
-    """Runs a read-only shell command under unprivileged service user."""
     try:
         res = subprocess.run(
             command,
@@ -122,16 +183,24 @@ def tool_run_shell_command(command: str) -> str:
             cwd=WORKSPACE_DIR,
         )
         out = (res.stdout + res.stderr).strip()
-        return out[:3000] if out else "(No output)"
+        return f"[exit={res.returncode}]\n{out[:3000]}" if out else f"[exit={res.returncode}] (No output)"
     except Exception as exc:
-        return f"Command execution error: {exc}"
+        return f"[error] Command error: {exc}"
 
 
 TOOLS_DECLARATION = [
     {
         "name": "tool_get_r8q_status",
-        "description": "Get real-time phone status: battery level, temperature, voltage, uptime, memory, and services.",
+        "description": "Get real-time phone status: battery level, power source, temperature, uptime, memory, disk, services.",
         "parameters": {"type": "OBJECT", "properties": {}},
+    },
+    {
+        "name": "tool_inspect_lan_host",
+        "description": "Inspect local network device or LAN status: DNS/mDNS query, ARP neighbours, and ping in one call.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {"target": {"type": "STRING", "description": "Hostname (.local), IP, or empty for active neighbours."}},
+        },
     },
     {
         "name": "tool_read_workspace_file",
@@ -169,6 +238,8 @@ TOOLS_DECLARATION = [
 def execute_tool_call(name: str, args: dict) -> str:
     if name == "tool_get_r8q_status":
         return tool_get_r8q_status()
+    elif name == "tool_inspect_lan_host":
+        return tool_inspect_lan_host(args.get("target", ""))
     elif name == "tool_read_workspace_file":
         return tool_read_workspace_file(args.get("filename", ""))
     elif name == "tool_write_workspace_file":
@@ -183,7 +254,7 @@ def load_history() -> list:
         try:
             with open(SESSION_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                return data[-14:]  # Last 7 turns
+                return data[-14:]
         except Exception:
             pass
     return []
@@ -198,12 +269,16 @@ def save_history(history: list) -> None:
         pass
 
 
-def call_gemini(api_key: str, contents: list, system_prompt: str) -> tuple[dict, str]:
+def call_gemini(api_key: str, contents: list, system_prompt: str, enable_tools: bool = True) -> tuple[dict, str]:
     payload = {
         "system_instruction": {"parts": [{"text": system_prompt}]},
         "contents": contents,
-        "tools": [{"function_declarations": TOOLS_DECLARATION}],
     }
+    if enable_tools:
+        payload["tools"] = [{"function_declarations": TOOLS_DECLARATION}]
+    else:
+        payload["tool_config"] = {"function_calling_config": {"mode": "NONE"}}
+
     body = json.dumps(payload).encode("utf-8")
     last_err = None
 
@@ -240,10 +315,19 @@ def ask_openclaw(prompt: str, env: dict) -> tuple[str, str]:
     history = load_history()
     contents = list(history) + [{"role": "user", "parts": [{"text": text}]}]
 
+    seen_calls = set()
     used_model = MODELS[0]
+
     try:
-        for _ in range(4):
-            res, used_model = call_gemini(api_key, contents, system_prompt)
+        for step in range(MAX_TOOL_ROUNDS + 1):
+            is_final_step = (step == MAX_TOOL_ROUNDS)
+            if is_final_step:
+                contents.append({
+                    "role": "user",
+                    "parts": [{"text": "[SYSTEM DIRECTIVE: Maximum tool exploration reached. Synthesize a concise, helpful final answer for the user based on the evidence gathered above.]"}],
+                })
+
+            res, used_model = call_gemini(api_key, contents, system_prompt, enable_tools=not is_final_step)
             cand = (res.get("candidates") or [{}])[0]
             content = cand.get("content") or {}
             parts = content.get("parts") or []
@@ -251,13 +335,14 @@ def ask_openclaw(prompt: str, env: dict) -> tuple[str, str]:
                 return "(Empty response from model)", used_model
 
             fn_calls = [p["functionCall"] for p in parts if "functionCall" in p]
-            if not fn_calls:
+            if not fn_calls or is_final_step:
                 reply_text = "\n".join(p.get("text", "") for p in parts if "text" in p).strip()
-                new_hist = list(history) + [
-                    {"role": "user", "parts": [{"text": text}]},
-                    {"role": "model", "parts": [{"text": reply_text}]},
-                ]
-                save_history(new_hist)
+                if reply_text:
+                    new_hist = list(history) + [
+                        {"role": "user", "parts": [{"text": text}]},
+                        {"role": "model", "parts": [{"text": reply_text}]},
+                    ]
+                    save_history(new_hist)
                 return reply_text or "(Empty reply)", used_model
 
             contents.append({"role": "model", "parts": parts})
@@ -265,7 +350,12 @@ def ask_openclaw(prompt: str, env: dict) -> tuple[str, str]:
             for fc in fn_calls:
                 fn_name = fc.get("name", "")
                 fn_args = fc.get("args") or {}
-                tool_out = execute_tool_call(fn_name, fn_args)
+                call_sig = (fn_name, json.dumps(fn_args, sort_keys=True))
+                if call_sig in seen_calls:
+                    tool_out = "[System note: This tool call has already been executed in this turn. Do not call it again; summarize answer.]"
+                else:
+                    seen_calls.add(call_sig)
+                    tool_out = execute_tool_call(fn_name, fn_args)
                 fn_responses.append(
                     {
                         "functionResponse": {
@@ -276,29 +366,85 @@ def ask_openclaw(prompt: str, env: dict) -> tuple[str, str]:
                 )
             contents.append({"role": "user", "parts": fn_responses})
 
-        return "Exceeded maximum tool loop limit.", used_model
+        return "Completed turn.", used_model
     except Exception as exc:
         return f"Error: {exc}", used_model
 
 
-def post_ntfy(message: str, env: dict, title: str = "🤖 OpenClaw", tags: str = "robot_face") -> None:
+def post_ntfy(message: str, env: dict, title: str = "🤖 OpenClaw", tags: str = "robot_face", priority: str = "default") -> None:
     ntfy_url = env.get("NTFY_URL", "http://127.0.0.1:2586").rstrip("/")
     ntfy_topic = env.get("NTFY_TOPIC", "openclaw")
     ntfy_token = env.get("NTFY_TOKEN", "")
     url = f"{ntfy_url}/{ntfy_topic}"
     req = urllib.request.Request(url, data=message.encode("utf-8"), method="POST")
-    # Encode Title using RFC-2047 MIME Base64 to prevent latin-1 HTTP header encoding errors
     b64_title = base64.b64encode(title.encode("utf-8")).decode("ascii")
     req.add_header("Title", f"=?utf-8?b?{b64_title}?=")
     req.add_header("Tags", tags)
+    if priority != "default":
+        req.add_header("Priority", priority)
     if ntfy_token:
         req.add_header("Authorization", f"Bearer {ntfy_token}")
     with urllib.request.urlopen(req, timeout=15) as resp:
         resp.read()
 
 
+def hardware_watchdog_loop() -> None:
+    """Continuously monitors power state, thermals, and battery."""
+    print("[openclaw-watchdog] Hardware watchdog loop started...", flush=True)
+    last_charger_state = None
+    last_temp_alert_time = 0
+
+    while True:
+        try:
+            env = load_env()
+            charger_online = None
+            for p in glob.glob("/sys/class/power_supply/*charger*/online"):
+                try:
+                    charger_online = int(open(p).read().strip())
+                except Exception:
+                    pass
+
+            cap = 0
+            for p in glob.glob("/sys/class/power_supply/*battery*/capacity"):
+                try:
+                    cap = int(open(p).read().strip())
+                except Exception:
+                    pass
+
+            if charger_online is not None:
+                if last_charger_state is None:
+                    last_charger_state = charger_online
+                elif charger_online != last_charger_state:
+                    if charger_online == 0:
+                        msg = f"⚠️ Power cut detected (or charger unplugged)!\nPhone running on internal battery ({cap}% remaining)."
+                        post_ntfy(msg, env, title="⚡ Power Outage / Battery", tags="warning,electric_plug", priority="high")
+                    else:
+                        msg = f"✅ Power restored!\nPhone charging again ({cap}% level)."
+                        post_ntfy(msg, env, title="🔌 Power Restored", tags="white_check_mark,zap", priority="default")
+                    last_charger_state = charger_online
+
+            temp_c = 0
+            for p in glob.glob("/sys/class/power_supply/*battery*/temp"):
+                try:
+                    temp_c = int(open(p).read().strip()) / 10.0
+                except Exception:
+                    pass
+            if temp_c >= 45.0 and (time.time() - last_temp_alert_time > 1800):
+                msg = f"🔥 Thermal alert on phone host!\nBattery temperature reached {temp_c:.1f}°C."
+                post_ntfy(msg, env, title="🔥 Thermal Alert", tags="fire,warning", priority="high")
+                last_temp_alert_time = time.time()
+
+        except Exception as exc:
+            print(f"[openclaw-watchdog] Watchdog error: {exc}", flush=True)
+
+        time.sleep(10)
+
+
 def listen_loop() -> None:
-    print("[openclaw-ntfy-bridge] Starting lightweight OpenClaw ntfy bridge...", flush=True)
+    print("[openclaw-ntfy-bridge] Starting OpenClaw ntfy bridge v3...", flush=True)
+    t = threading.Thread(target=hardware_watchdog_loop, daemon=True)
+    t.start()
+
     while True:
         env = load_env()
         ntfy_url = env.get("NTFY_URL", "http://127.0.0.1:2586").rstrip("/")
@@ -320,7 +466,7 @@ def listen_loop() -> None:
                     title = data.get("title") or ""
                     tags = data.get("tags") or []
                     msg = (data.get("message") or "").strip()
-                    if "robot_face" in tags or title.startswith("🤖"):
+                    if "robot_face" in tags or title.startswith("🤖") or "warning" in tags or "white_check_mark" in tags:
                         continue
                     if not msg:
                         continue

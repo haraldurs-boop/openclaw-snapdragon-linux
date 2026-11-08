@@ -19,6 +19,13 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import sys
+sys.path.insert(0, "/home/openclaw")
+import openclaw_fastpath as fastpath
+from openclaw_localllm import call_local_llama, is_night_window, LocalLlamaUnavailable
+
+class TierUnavailable(Exception):
+    """Kastað ef LLM þjónusta (Gemini eða Groq) lendir í 429/503 eða kvótabresti."""
 
 WORKSPACE_DIR = "/home/openclaw/.openclaw/workspace"
 SESSION_FILE = "/home/openclaw/.openclaw/agents/main/sessions/ntfy_session.json"
@@ -610,6 +617,14 @@ def execute_tool_call(name: str, args: dict) -> str:
 
 execute_tool = execute_tool_call
 
+fastpath.bind_tools(
+    status=tool_get_r8q_status,
+    inspect_lan=tool_inspect_lan_host,
+    wake=tool_wake_device,
+    updates=tool_get_security_updates,
+    kuma=tool_get_uptime_kuma_status,
+)
+
 
 def load_history() -> list:
     if os.path.exists(SESSION_FILE):
@@ -665,7 +680,7 @@ def call_gemini(api_key: str, contents: list, system_prompt: str, enable_tools: 
             print(f"[openclaw-bridge] {model} nettengingarvilla, reyni næsta líkan...", flush=True)
             time.sleep(0.5)
 
-    raise RuntimeError(f"Öll Gemini líkön mistókust. Síðasta villa: {last_err}")
+    raise TierUnavailable(f"Öll Gemini líkön mistókust. Síðasta villa: {last_err}")
 
 GROQ_MODELS = [
     "openai/gpt-oss-120b",
@@ -739,7 +754,7 @@ def call_groq(api_key: str, contents: list, system_prompt: str, enable_tools: bo
             print(f"[openclaw-bridge] Groq {model} tengingarvilla, reyni næsta Groq líkan...", flush=True)
             time.sleep(0.5)
 
-    raise RuntimeError(f"Öll Groq líkön mistókust. Síðasta villa: {last_err}")
+    raise TierUnavailable(f"Öll Groq líkön mistókust. Síðasta villa: {last_err}")
 
 
 def sanitize_for_external_llm(text: str) -> tuple[str, dict]:
@@ -966,9 +981,25 @@ def ask_openclaw(prompt: str, env: dict) -> tuple[str, str]:
                     print(f"[openclaw-bridge] Groq mistókst ({e_groq}).", flush=True)
                     res = None
 
-            # 3. Ef bæði brugðust: Fallback 2 (Human-in-the-Loop Relay)
+            # 3. Ef bæði bregðast: Reyna Local Llama (ef í næturglugga 23:30 - 07:10)
+            if res is None and is_night_window():
+                try:
+                    print("[openclaw-bridge] Reyni Local Llama (næturgluggi)...", flush=True)
+                    res_llama, used_model = call_local_llama(contents, system_prompt)
+                    llama_text = "🌙 (staðvært líkan, enska)\n" + res_llama.get("text", "")
+                    new_hist = list(history) + [
+                        {"role": "user", "parts": [{"text": text}]},
+                        {"role": "model", "parts": [{"text": llama_text}]},
+                    ]
+                    save_history(new_hist)
+                    return llama_text, used_model
+                except LocalLlamaUnavailable as e_llama:
+                    print(f"[openclaw-bridge] Local Llama féll ({e_llama.reason}), held áfram í Relay...", flush=True)
+                    res = None
+
+            # 4. Ef öll LLM brugðust: Fallback 3 (Human-in-the-Loop Relay)
             if res is None:
-                print("[openclaw-bridge] Bæði Gemini og Groq brugðust -> Virkja Fallback 2 Prompt-Relay...", flush=True)
+                print("[openclaw-bridge] Öll LLM brugðust -> Virkja Fallback 3 Prompt-Relay...", flush=True)
                 return trigger_prompt_relay(text, env), "prompt-relay"
 
             cand = (res.get("candidates") or [{}])[0]
@@ -1361,6 +1392,15 @@ def listen_loop() -> None:
                     if msg.startswith("@cmd:confirm_update"):
                         print("[openclaw-ntfy-bridge] Móttekin uppfærslustaðfesting (@cmd:confirm_update)...", flush=True)
                         handle_confirm_update(env)
+                        continue
+
+                    # Fast-Path Router (Þrep 0: 0 tokens, < 50ms)
+                    fast = fastpath.try_fast_path(
+                        msg, progress=lambda m: post_ntfy(m, env, title="OpenClaw", tags="hourglass")
+                    )
+                    if fast is not None:
+                        post_ntfy(fast.text, env, title=fast.title, tags=",".join(fast.tags) if fast.tags else "robot_face")
+                        print(f"[openclaw-bridge] Fast-path {fast.intents} {fast.elapsed_ms:.1f} ms", flush=True)
                         continue
 
                     print(f"[openclaw-ntfy-bridge] Fyrirspurn: {msg[:80]}", flush=True)

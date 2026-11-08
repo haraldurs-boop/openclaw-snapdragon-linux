@@ -85,12 +85,14 @@ This repository provides the complete post-mortem, system tuning rules, and a li
   MACAddress=00:03:7f:12:xx:xx
   ```
 
-### D. 3-Tier Zero-Cost LLM Fallback & Privacy-Preserving Prompt-Relay
-* **The Problem:** Free-tier API rate limits (HTTP 429 quota exhaustion) on Google AI Studio can stall agent workflows during peak activity. Paying for enterprise API access or recurring subscriptions is often undesirable for a self-hosted personal server.
-* **The Mitigation:** The bridge implements a zero-cost 3-tier resilient cascade:
-  1. **Primary (Google Gemini):** Multi-tier cascade across Gemini models (`gemini-3.8-flash` ➔ `gemini-3.6-flash` ➔ `gemini-3.5-flash` ➔ `gemini-2.5-flash`).
-  2. **Fallback 1 (Groq Cloud API):** If Gemini exhausts quotas (HTTP 429), the bridge seamlessly pivots to Groq's free `llama-3.3-70b-versatile` API using lightweight OpenAI-compatible function calling (0 MB RAM overhead).
-  3. **Fallback 2 (Human-in-the-Loop Prompt-Relay):** If both APIs are throttled, OpenClaw pre-fetches local system and network diagnostics (battery, uptime, ARP table, Uptime Kuma), runs them through a strict two-way **Sanitization Engine** (stripping all real IPs, MACs, tailnet hostnames, and secret tokens), and posts a copy-pasteable Markdown package directly to `ntfy`. The user can copy the prompt into any free web LLM (ChatGPT, Claude, Grok, Meta AI) and reply on `ntfy` (`Svar: ...`). OpenClaw decodes the tokenized entities and saves the response to persistent session memory.
+### D. 5-Layer Zero-Cost Pipeline (Deterministic Fast-Path + Cloud + Local Edge + Human Relay)
+* **The Problem:** Free-tier API rate limits (HTTP 429 quota exhaustion) on cloud LLMs can stall agent workflows. Conversely, querying cloud LLMs for simple hardware status checks (battery %, uptime, monitor status) burns precious tokens and adds 1–3 seconds of unnecessary latency. Running continuous local LLMs on a phone heats up the battery and risks thermal throttling.
+* **The Mitigation:** The bridge implements a multi-tier pipeline designed for high resilience, zero API cost, and sub-millisecond local execution:
+  1. **Layer 0 (Deterministic Fast-Path Router - `openclaw_fastpath.py`):** Pure regex and deterministic command routing with **0 tokens and 0 LLM latency** (~10 microseconds classification, 1–8 ms file/SQLite read). Handles queries like status, battery, tablet reachability, Uptime Kuma monitors, and package updates directly on-device.
+  2. **Layer 1 (Google Gemini Developer API):** Primary cloud reasoning engine with automatic fallback cascade across Gemini models (`gemini-3.8-flash` ➔ `gemini-3.6-flash` ➔ `gemini-3.5-flash` ➔ `gemini-2.5-flash`).
+  3. **Layer 2 (Groq Cloud API):** Fast OpenAI-compatible cloud fallback (`openai/gpt-oss-120b`, `openai/gpt-oss-20b`, `qwen/qwen3.8-27b`) triggered seamlessly if Gemini returns HTTP 429/503.
+  4. **Layer 3 (Cold-Run Local llama.cpp - `openclaw_localllm.py`):** On-device small model (`http://127.0.0.1:8081`) running exclusively during night hours (**23:30 – 07:10**) with thermal protection (rejects if battery >= 41°C) and tight window expiration guards.
+  5. **Layer 4 (Human-in-the-Loop Prompt-Relay):** When all automated tiers are unavailable, OpenClaw pre-fetches system diagnostics, runs them through a strict two-way **Sanitization Engine** (stripping all real IPs, MACs, tailnet hostnames, and tokens), and posts a ready-to-copy Markdown bundle to `ntfy`. The user copies it to any free web LLM (ChatGPT, Claude, Grok) and replies via `ntfy` (`Svar: ...`). OpenClaw decodes the tokenized placeholders and persists the answer.
 
 ### E. Public Tailscale Funnel Action Buttons
 * **The Problem:** Interactive notifications with HTTP Action buttons (`Actions: http, ...`) fail when constructed with loopback URLs (`http://127.0.0.1:2586`) because mobile clients cannot resolve `127.0.0.1` back to the server.

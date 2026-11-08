@@ -56,8 +56,8 @@ def load_workspace_prompt() -> str:
         "Svaraðu alltaf á góðri íslensku nema beðið sé um annað. Hafðu svörin hnitmiðuð, skýr og hjálpleg fyrir farsímaskjá.",
         "\nREGLUR UM VERKFÆRAKÖLL OG HEIMANETIÐ:",
         "- Notaðu verkfæri sparlega (hámark 3-4 köll á fyrirspurn).",
-        "- Ef spurt er um stöðu á spjaldtölvu eða heimaneti (t.d. taba / taba.local), notaðu `tool_inspect_lan_host`.",
-        "- Ef beðið er um að VEKJA tæki eða spjaldtölvu (taba), notaðu `tool_wake_device` sem sendir bæði WoL Magic Packet og Wi-Fi DTIM Wake-burst.",
+        "- Ef spurt er um stöðu á spjaldtölvu eða heimaneti (t.d. tab4 / tab4.local / taba / Galaxy Tab 4), notaðu `tool_inspect_lan_host`.",
+        "- Ef beðið er um að VEKJA tæki eða spjaldtölvu (tab4 / taba), notaðu `tool_wake_device` sem sendir bæði WoL Magic Packet og Wi-Fi DTIM Wake-burst.",
         "- Ef tækið vaknar (woke_up=True), staðfestu það gleðilega.",
         "- Ef tækið vaknar ekki (woke_up=False), útskýrðu faglega að vakningarpakkar hafi verið sendir en tækið svari ekki (líklega alveg slökkt á því, rafhlaðan tóm, eða utan þjónustusvæðis).",
         "\nÖRYGGIS- OG KERFISUPPFÆRSLUR (R8Q & GALAXY TAB 4):",
@@ -159,19 +159,34 @@ def tool_inspect_lan_host(target: str = "") -> str:
         res["arp_error"] = str(e)
 
     ping_target = res["resolved_ips"][0] if res["resolved_ips"] else (target if re.match(r"^\d+\.\d+\.\d+\.\d+$", target) else None)
+    if not ping_target and any(k in target.lower() for k in ["tab", "spjald"]):
+        ping_target = "192.168.68.77"
+
+    # Dýnamísk MAC-uppgötvun fyrir Galaxy Tab 4 (10:30:47:ea:d9:81) ef IP hefur breyst
+    if any(k in target.lower() for k in ["tab", "spjald"]):
+        for m in res.get("arp_matches", []):
+            if m.get("mac", "").lower() == "10:30:47:ea:d9:81":
+                arp_ip = m.get("ip")
+                if arp_ip and arp_ip != ping_target:
+                    res["discovered_mac_ip"] = arp_ip
+                    ping_target = arp_ip
+                break
+
     if ping_target:
         try:
-            p = subprocess.run(["ping", "-c", "1", "-W", "2", ping_target], capture_output=True, text=True, timeout=4)
+            # 2 ping með 2 sekúndna bið til að gefa sofandi Wi-Fi viðmóti tíma til að vakna
+            p = subprocess.run(["ping", "-c", "2", "-W", "2", ping_target], capture_output=True, text=True, timeout=5)
             res["ping_ok"] = (p.returncode == 0)
+            res["ping_target"] = ping_target
         except Exception:
             pass
 
     return json.dumps(res, ensure_ascii=False, indent=2)
 
 
-def tool_wake_device(target: str = "taba.local") -> str:
+def tool_wake_device(target: str = "tab4.local") -> str:
     """Sendir fjölþrepa vakningarpakka á tæki (WoL Magic Packet + Wi-Fi DTIM Unicast burst)."""
-    target = (target or "taba.local").strip()
+    target = (target or "tab4.local").strip()
     report = {"target": target, "actions": [], "woke_up": False, "target_ip": None, "mac": None}
 
     # 1. Finna IP tölu
@@ -189,12 +204,12 @@ def tool_wake_device(target: str = "taba.local") -> str:
         except Exception:
             pass
 
-    if not target_ip and "taba" in target.lower():
-        target_ip = "192.168.68.75"
+    if not target_ip and any(k in target.lower() for k in ["tab", "spjald"]):
+        target_ip = "192.168.68.77"
 
     report["target_ip"] = target_ip
 
-    # 2. Finna MAC tölu ef hún er í ARP töflunni
+    # 2. Finna MAC tölu ef hún er í ARP töflunni eða uppgötva nýja IP miðað við fast MAC
     found_mac = None
     try:
         neigh_out = subprocess.run(["ip", "neigh", "show"], capture_output=True, text=True, timeout=3).stdout
@@ -203,16 +218,25 @@ def tool_wake_device(target: str = "taba.local") -> str:
             if len(parts) >= 5 and parts[3] == "lladdr":
                 if target_ip and parts[0] == target_ip:
                     found_mac = parts[4]
+                if any(k in target.lower() for k in ["tab", "spjald"]) and parts[4].lower() == "10:30:47:ea:d9:81":
+                    found_mac = parts[4]
+                    if parts[0] != target_ip:
+                        report["actions"].append(f"Spjaldtölva fannst á nýrri IP úr ARP: {parts[0]} (í stað {target_ip}).")
+                        target_ip = parts[0]
+                        report["target_ip"] = target_ip
                     break
     except Exception:
         pass
+
+    if not found_mac and (target_ip == "192.168.68.77" or any(k in target.lower() for k in ["tab", "spjald"])):
+        found_mac = "10:30:47:ea:d9:81"
 
     report["mac"] = found_mac
 
     # 3. Þrep A: Senda WoL Magic Packet
     try:
         # Ef við höfum ákveðið MAC, sendum á það. Annars sendum almennt broadcast.
-        mac_to_use = found_mac or "1a:af:e7:49:41:25"
+        mac_to_use = found_mac or "10:30:47:ea:d9:81"
         mac_bytes = bytes.fromhex(mac_to_use.replace(":", "").replace("-", ""))
         pkt = b"\xff" * 6 + mac_bytes * 16
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
@@ -246,10 +270,10 @@ def tool_wake_device(target: str = "taba.local") -> str:
         except Exception as e:
             report["actions"].append(f"DTIM burst villa: {e}")
 
-    # 5. Þrep C: Staðfesting - Bíða í 1.2 sek og pinga
+    # 5. Þrep C: Staðfesting - Bíða í 1.2 sek og pinga (2 tilraunir vegna DTIM)
     time.sleep(1.2)
     if target_ip:
-        p = subprocess.run(["ping", "-c", "1", "-W", "2", target_ip], capture_output=True, text=True)
+        p = subprocess.run(["ping", "-c", "2", "-W", "2", target_ip], capture_output=True, text=True)
         report["woke_up"] = (p.returncode == 0)
 
     return json.dumps(report, ensure_ascii=False, indent=2)
@@ -513,15 +537,15 @@ TOOLS_DECLARATION = [
         "description": "Kanna tæki eða stöðu heimanetsins: getent/mDNS uppfletting, ARP nágrannar og ping.",
         "parameters": {
             "type": "OBJECT",
-            "properties": {"target": {"type": "STRING", "description": "Lén, hýsilnafn (t.d. taba.local) eða IP-tala."}},
+            "properties": {"target": {"type": "STRING", "description": "Lén, hýsilnafn (t.d. tab4, tab4.local eða taba) eða IP-tala."}},
         },
     },
     {
         "name": "tool_wake_device",
-        "description": "Reyna að vekja tæki eða spjaldtölvu (t.d. taba / taba.local) úr dvala með WoL og Wi-Fi wake-burst.",
+        "description": "Reyna að vekja tæki eða spjaldtölvu (t.d. tab4 / tab4.local / taba) úr dvala með WoL og Wi-Fi wake-burst.",
         "parameters": {
             "type": "OBJECT",
-            "properties": {"target": {"type": "STRING", "description": "Hýsilnafn t.d. taba.local eða IP tala."}},
+            "properties": {"target": {"type": "STRING", "description": "Hýsilnafn t.d. tab4.local, taba.local eða IP tala."}},
         },
     },
     {
@@ -570,7 +594,7 @@ def execute_tool_call(name: str, args: dict) -> str:
     elif name == "tool_inspect_lan_host":
         return tool_inspect_lan_host(args.get("target", ""))
     elif name == "tool_wake_device":
-        return tool_wake_device(args.get("target", "taba.local"))
+        return tool_wake_device(args.get("target", "tab4.local"))
     elif name == "tool_read_workspace_file":
         return tool_read_workspace_file(args.get("filename", ""))
     elif name == "tool_write_workspace_file":
@@ -643,9 +667,15 @@ def call_gemini(api_key: str, contents: list, system_prompt: str, enable_tools: 
 
     raise RuntimeError(f"Öll Gemini líkön mistókust. Síðasta villa: {last_err}")
 
+GROQ_MODELS = [
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
+    "qwen/qwen3.8-27b",
+]
+
+
 def call_groq(api_key: str, contents: list, system_prompt: str, enable_tools: bool = True) -> tuple[dict, str]:
-    """Kallar á Groq (Llama 3.3 70B) og skilar svari á nákvæmlega sama innra sniði og call_gemini."""
-    model = "llama-3.3-70b-versatile"
+    """Kallar á Groq (GPT-OSS 120B / 20B / Qwen 27B) og skilar svari á nákvæmlega sama innra sniði og call_gemini."""
     messages = [{"role": "system", "content": system_prompt}]
     for turn in contents:
         role = "assistant" if turn["role"] == "model" else "user"
@@ -656,7 +686,7 @@ def call_groq(api_key: str, contents: list, system_prompt: str, enable_tools: bo
         elif fn_res:
             messages.append({"role": "user", "content": "Niðurstaða verkfæris:\n" + json.dumps(fn_res, ensure_ascii=False)})
 
-    payload = {"model": model, "messages": messages, "temperature": 0.2}
+    openai_tools = None
     if enable_tools:
         openai_tools = []
         for t in TOOLS_DECLARATION:
@@ -669,31 +699,47 @@ def call_groq(api_key: str, contents: list, system_prompt: str, enable_tools: bo
                     "parameters": params,
                 },
             })
-        payload["tools"] = openai_tools
 
-    req = urllib.request.Request(
-        "https://api.groq.com/openai/v1/chat/completions",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-            "User-Agent": "openclaw/1.0"
-        },
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=25) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
+    last_err = None
+    for model in GROQ_MODELS:
+        payload = {"model": model, "messages": messages, "temperature": 0.2}
+        if openai_tools:
+            payload["tools"] = openai_tools
 
-    msg = data["choices"][0]["message"]
-    parts = []
-    if msg.get("content"):
-        parts.append({"text": msg["content"]})
-    for tc in msg.get("tool_calls") or []:
-        fn = tc["function"]
-        args = json.loads(fn.get("arguments") or "{}") if isinstance(fn.get("arguments"), str) else (fn.get("arguments") or {})
-        parts.append({"functionCall": {"name": fn["name"], "args": args}})
+        req = urllib.request.Request(
+            "https://api.groq.com/openai/v1/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+                "User-Agent": "openclaw/1.0",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=25) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            msg = data["choices"][0]["message"]
+            parts = []
+            if msg.get("content"):
+                parts.append({"text": msg["content"]})
+            for tc in msg.get("tool_calls") or []:
+                fn = tc["function"]
+                args = json.loads(fn.get("arguments") or "{}") if isinstance(fn.get("arguments"), str) else (fn.get("arguments") or {})
+                parts.append({"functionCall": {"name": fn["name"], "args": args}})
 
-    return {"candidates": [{"content": {"parts": parts}}]}, f"groq/{model}"
+            return {"candidates": [{"content": {"parts": parts}}]}, f"groq/{model}"
+        except urllib.error.HTTPError as e:
+            err_body = e.read().decode("utf-8", errors="replace")
+            last_err = f"{model} skilaði HTTP {e.code}: {err_body[:200]}"
+            print(f"[openclaw-bridge] Groq {model} brást ({e.code}), reyni næsta Groq líkan...", flush=True)
+            time.sleep(0.5)
+        except Exception as e:
+            last_err = f"{model} villa: {e}"
+            print(f"[openclaw-bridge] Groq {model} tengingarvilla, reyni næsta Groq líkan...", flush=True)
+            time.sleep(0.5)
+
+    raise RuntimeError(f"Öll Groq líkön mistókust. Síðasta villa: {last_err}")
 
 
 def sanitize_for_external_llm(text: str) -> tuple[str, dict]:
@@ -726,10 +772,14 @@ def sanitize_for_external_llm(text: str) -> tuple[str, dict]:
     # Þekkt heimilistæki og hýsingar
     known_replacements = [
         ("192.168.68.87", "<SERVER_IP>"),
-        ("192.168.68.75", "<TABLET_HOST>"),
         ("192.168.68.77", "<TABLET_HOST>"),
+        ("192.168.68.75", "<TABLET_HOST>"),
         ("192.168.68.1", "<ROUTER_IP>"),
+        ("tab4.local", "<TABLET_HOST>"),
+        ("tab4", "<TABLET_HOST>"),
         ("taba.local", "<TABLET_HOST>"),
+        ("taba", "<TABLET_HOST>"),
+        ("10:30:47:ea:d9:81", "<TABLET_MAC>"),
         ("1a:af:e7:49:41:25", "<TABLET_MAC>"),
     ]
     for orig, rep in known_replacements:
@@ -801,9 +851,10 @@ def gather_context_for_prompt(prompt: str) -> str:
         except Exception as e:
             ctx_parts.append(f"Kerfisstöðuvilla: {e}")
 
-    if any(k in low for k in ["taba", "spjaldtölv", "spjaldtolv", "net", "host", "ip", "local", "ping", "arps"]):
+    if any(k in low for k in ["tab", "tab4", "taba", "spjaldtölv", "spjaldtolv", "net", "host", "ip", "local", "ping", "arps"]):
         try:
-            ctx_parts.append("NET- OG TÆKJASTAÐA:\n" + tool_inspect_lan_host("taba.local" if "taba" in low else ""))
+            target_to_inspect = "tab4" if any(k in low for k in ["tab", "spjald"]) else ""
+            ctx_parts.append("NET- OG TÆKJASTAÐA:\n" + tool_inspect_lan_host(target_to_inspect))
         except Exception as e:
             ctx_parts.append(f"Netstöðuvilla: {e}")
 
@@ -885,6 +936,7 @@ def ask_openclaw(prompt: str, env: dict) -> tuple[str, str]:
 
     seen_calls = set()
     used_model = MODELS[0]
+    gemini_enabled = bool(api_key)
 
     try:
         for step in range(MAX_TOOL_ROUNDS + 1):
@@ -897,11 +949,12 @@ def ask_openclaw(prompt: str, env: dict) -> tuple[str, str]:
 
             res = None
             # 1. Reyna Gemini fyrst
-            if api_key:
+            if gemini_enabled:
                 try:
                     res, used_model = call_gemini(api_key, contents, system_prompt, enable_tools=not is_final_step)
                 except Exception as e_gemini:
                     print(f"[openclaw-bridge] Gemini mistókst ({e_gemini}).", flush=True)
+                    gemini_enabled = False
                     res = None
 
             # 2. Ef Gemini brást: Reyna Groq (Fallback 1)

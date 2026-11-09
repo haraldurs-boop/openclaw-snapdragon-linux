@@ -15,14 +15,13 @@ ExecStart=/opt/llama-b12206/llama-server \
   -np 1 \
   -t 2 \
   -tb 2 \
+  -b 256 \
+  --cache-ram 256 \
   --poll 0 \
   --no-webui
 Restart=no
-CPUAffinity=0 1
+CPUAffinity=2 3
 Nice=19
 MemoryMax=2.5G
 OOMScoreAdjust=900
 TimeoutStopSec=10
-
-[Install]
-WantedBy=multi-user.target

@@ -38,10 +38,10 @@ MAX_QUERY_CHARS = 400
 MODEL_LABEL = "qwen2.5-1.5b"
 
 LOCAL_SYSTEM_PROMPT = (
-    "You are OpenClaw's offline backup assistant running on a small phone. "
-    "The user writes in Icelandic. Reply in English, at most 3 short sentences. "
-    "You have no tools and no access to live device data: never invent numbers, "
-    "statuses or file contents. If you cannot answer reliably, say so briefly."
+    "You are a small offline backup assistant running on a phone; the main assistant is unavailable. "
+    "Answer in English, in at most 3 short sentences. Plain text, no lists. The user may write in Icelandic. "
+    "Still answer in English. If you are not sure you understood, say so and ask for a short rephrasing in English. "
+    "You have no tools and no internet. Never claim to have checked or done anything. If you don't know, say 'I don't know'."
 )
 
 # Orð sem gefa til kynna að fyrirspurn krefjist aðgerðar/breytinga (sem 1.5B líkan má ALDREI gera)

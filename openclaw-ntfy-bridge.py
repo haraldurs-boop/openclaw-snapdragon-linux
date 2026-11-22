@@ -40,7 +40,7 @@ MODELS = [
 
 MAX_TOOL_ROUNDS = 4
 
-PUBLIC_NTFY_URL = os.environ.get("PUBLIC_NTFY_URL", "https://r8q.tailc4cc48.ts.net:10000")
+PUBLIC_NTFY_URL = os.environ.get("PUBLIC_NTFY_URL", "https://your-node.tailnet.ts.net:10000")
 PENDING_RELAY_FILE = "/tmp/openclaw_relay_state.json"
 
 

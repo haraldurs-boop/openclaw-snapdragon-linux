@@ -75,6 +75,10 @@ def load_workspace_prompt() -> str:
         "\nUPTIME KUMA OG NÆTURVAKT ANTIGRAVITY:",
         "- Ef spurt er um stöðu vefþjónusta, uppitíma, niðritíma eða Uptime Kuma (t.d. 'Hvað er niðri?', 'Er AdGuard uppi?'): notaðu `tool_get_uptime_kuma_status`.",
         "- Ef spurt er um næturvaktina, nýjustu næturskýrslu eða hvort Argon kvaðning bíði (t.d. 'Hvað gerði næturvaktin í nótt?'): notaðu `tool_get_nightly_report`.",
+        "\nENDURRÆSINGAR OG SNAPDRAGON-VESEN:",
+        "- Ef spurt er um síðustu endurræsingu, hrun eða hvort eitthvað snapdragon-vesen hafi komið upp: notaðu `tool_get_r8q_status` (sem skilar `last_reboot` úr /var/cache/r8q_last_reboot.json).",
+        "- Þegar endurræsing stafar af Snapdragon 865 (SM8250) WFI / RCU kjarnahvíldarhökti (`is_snapdragon_vesen=True`), notaðu alltaf orðalagið „eðlilegt snapdragon-vesen“.",
+
     ]
     for name in ("SOUL.md", "IDENTITY.md", "USER.md", "MEMORY.md"):
         p = os.path.join(WORKSPACE_DIR, name)
@@ -1081,6 +1085,7 @@ def post_ntfy(message: str, env: dict, title: str = "🤖 OpenClaw", tags: str =
 
 
 LAST_TRIAGE_HASH_FILE = "/tmp/openclaw_last_triage.hash"
+TRIAGE_TRIGGER_FILE = "/home/openclaw/.openclaw/r8q_triage_trigger.json"
 
 
 def build_triage_actions(env: dict) -> str:
@@ -1100,14 +1105,14 @@ def handle_confirm_update(env: dict) -> None:
     """Tekur við @cmd:confirm_update frá ntfy hnappi og ræsir uppfærslu sem rót."""
     status_file = "/var/cache/r8q_update_status.json"
     if not os.path.exists(status_file):
-        post_ntfy("⚠️ Villa: Stöðuskrá fannst ekki. Get ekki virkjað uppfærslu.", env, title="⚠️ Uppfærsla stöðvuð", tags="warning")
+        post_ntfy("⚠️ Villa: Stöðuskrá fannst ekki. Get ekki virkjað uppfærslu.", env, title="⚠️ Uppfærsla stöðvuð", tags="warning", topic="kerfi")
         return
     try:
         with open(status_file, "r", encoding="utf-8") as f:
             sdata = json.load(f)
         token = sdata.get("token")
         if not token:
-            post_ntfy("⚠️ Villa: Ekkert öryggistákn fannst í stöðuskrá.", env, title="⚠️ Uppfærsla stöðvuð", tags="warning")
+            post_ntfy("⚠️ Villa: Ekkert öryggistákn fannst í stöðuskrá.", env, title="⚠️ Uppfærsla stöðvuð", tags="warning", topic="kerfi")
             return
 
         url = f"http://127.0.0.1:8080/api/update-confirm?token={token}&confirm=1"
@@ -1120,10 +1125,11 @@ def handle_confirm_update(env: dict) -> None:
             "Pakkastjórinn keyrir nú í bakgrunni sem rót. Þú færð tilkynningu um leið og henni lýkur.",
             env,
             title="⚡ Uppfærsla hafin",
-            tags="rocket"
+            tags="rocket",
+            topic="kerfi"
         )
     except Exception as exc:
-        post_ntfy(f"⚠️ Villa við að virkja uppfærslu: {exc}", env, title="⚠️ Uppfærsluvilla", tags="warning")
+        post_ntfy(f"⚠️ Villa við að virkja uppfærslu: {exc}", env, title="⚠️ Uppfærsluvilla", tags="warning", topic="kerfi")
 
 
 def run_proactive_triage(payload: dict) -> None:
@@ -1164,7 +1170,8 @@ def run_proactive_triage(payload: dict) -> None:
                         title="📦 Kerfisuppfærslur í bið",
                         tags="package",
                         priority="default",
-                        actions=build_triage_actions(env)
+                        actions=build_triage_actions(env),
+                        topic="kerfi"
                     )
                     return
         except Exception:
@@ -1249,13 +1256,29 @@ def run_proactive_triage(payload: dict) -> None:
 
 
 def hardware_watchdog_loop() -> None:
-    """Fylgist stöðugt með rafmagni (hleðslutæki úr sambandi/rafmagnsleysi), hita og rafhlöðu."""
+    """Fylgist stöðugt með rafmagni (hleðslutæki úr sambandi/rafmagnsleysi) og triage-kveikjuskrá."""
     print("[openclaw-watchdog] Vélbúnaðar- og rafmagnsgæsla ræst...", flush=True)
     last_charger_state = None
-    last_temp_alert_time = 0
 
     while True:
         try:
+            # 1. Athuga kveikjuskrá fyrir Proactive AI Triage (kemur í veg fyrir hrátt JSON í ntfy)
+            if os.path.exists(TRIAGE_TRIGGER_FILE):
+                payload = {}
+                try:
+                    with open(TRIAGE_TRIGGER_FILE, "r", encoding="utf-8") as f:
+                        payload = json.load(f)
+                except Exception as exc_read:
+                    print(f"[openclaw-watchdog] Villa við lestur triage kveikjuskrár: {exc_read}", flush=True)
+                try:
+                    os.remove(TRIAGE_TRIGGER_FILE)
+                except Exception as exc_rm:
+                    print(f"[openclaw-watchdog] Villa við að eyða triage kveikjuskrá: {exc_rm}", flush=True)
+                try:
+                    run_proactive_triage(payload)
+                except Exception as exc_tr:
+                    print(f"[openclaw-watchdog] Villa við triage keyrslu: {exc_tr}", flush=True)
+
             env = load_env()
             charger_online = None
             for p in glob.glob("/sys/class/power_supply/*charger*/online"):
@@ -1282,17 +1305,6 @@ def hardware_watchdog_loop() -> None:
                         msg = f"✅ Rafmagn komst aftur á!\nSíminn er aftur í hleðslu ({cap}% staða)."
                         post_ntfy(msg, env, title="🔌 Rafmagn komið á", tags="white_check_mark,zap", priority="default", topic="kerfi")
                     last_charger_state = charger_online
-
-            temp_c = 0
-            for p in glob.glob("/sys/class/power_supply/*battery*/temp"):
-                try:
-                    temp_c = int(open(p).read().strip()) / 10.0
-                except Exception:
-                    pass
-            if temp_c >= 45.0 and (time.time() - last_temp_alert_time > 1800):
-                msg = f"🔥 Hitaviðvörun á r8q símanum!\nHitastig rafhlöðu er komið í {temp_c:.1f}°C."
-                post_ntfy(msg, env, title="🔥 Hitaviðvörun", tags="fire,warning", priority="high", topic="kerfi")
-                last_temp_alert_time = time.time()
 
         except Exception as exc:
             print(f"[openclaw-watchdog] Villa í eftirliti: {exc}", flush=True)

@@ -40,7 +40,7 @@ MODELS = [
 
 MAX_TOOL_ROUNDS = 4
 
-PUBLIC_NTFY_URL = os.environ.get("PUBLIC_NTFY_URL", "https://your-node.tailnet.ts.net:10000")
+PUBLIC_NTFY_URL = os.environ.get("PUBLIC_NTFY_URL", "https://r8q.tailc4cc48.ts.net:10000")
 PENDING_RELAY_FILE = "/tmp/openclaw_relay_state.json"
 
 
@@ -626,12 +626,18 @@ fastpath.bind_tools(
 )
 
 
+SESSION_TTL_SECONDS = 7200  # 2 klukkustundir: núllstilla ef þögn hefur staðið yfir
+
 def load_history() -> list:
     if os.path.exists(SESSION_FILE):
         try:
+            mtime = os.path.getmtime(SESSION_FILE)
+            if time.time() - mtime > SESSION_TTL_SECONDS:
+                print(f"[openclaw-bridge] Samtalssaga eldri en {SESSION_TTL_SECONDS//3600} klst, hreinsa minnisglugga.", flush=True)
+                return []
             with open(SESSION_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                return data[-14:]
+                return data[-8:]  # Hám. 8 síðustu skref (4 umferðir) til að spara forfyllingu
         except Exception:
             pass
     return []
@@ -1050,9 +1056,9 @@ def ask_openclaw(prompt: str, env: dict) -> tuple[str, str]:
             return f"Villa í OpenClaw: {exc}", used_model
 
 
-def post_ntfy(message: str, env: dict, title: str = "🤖 OpenClaw", tags: str = "robot_face", priority: str = "default", actions: str = "") -> None:
+def post_ntfy(message: str, env: dict, title: str = "🤖 OpenClaw", tags: str = "robot_face", priority: str = "default", actions: str = "", topic: str = "") -> None:
     ntfy_url = env.get("NTFY_URL", "http://127.0.0.1:2586").rstrip("/")
-    ntfy_topic = env.get("NTFY_TOPIC", "openclaw")
+    ntfy_topic = topic or env.get("NTFY_TOPIC", "openclaw")
     ntfy_token = env.get("NTFY_TOKEN", "")
     url = f"{ntfy_url}/{ntfy_topic}"
     req = urllib.request.Request(url, data=message.encode("utf-8"), method="POST")
@@ -1236,7 +1242,8 @@ def run_proactive_triage(payload: dict) -> None:
         title=f"🛡️ OpenClaw: Öryggismat ({model_used})",
         tags="shield,warning" if urgency == "urgent" else "shield,package",
         priority="high" if urgency == "urgent" else "default",
-        actions=actions
+        actions=actions,
+        topic="kerfi"
     )
     print(f"[openclaw-triage] Triage tilkynning send ({model_used}).", flush=True)
 
@@ -1270,10 +1277,10 @@ def hardware_watchdog_loop() -> None:
                 elif charger_online != last_charger_state:
                     if charger_online == 0:
                         msg = f"⚠️ Rafmagn fór af heimilinu (eða hleðslutæki tekið úr sambandi)!\nSíminn keyrir nú á innbyggðri rafhlöðu ({cap}% eftir)."
-                        post_ntfy(msg, env, title="⚡ Rafmagnsleysi / Rafhlaða", tags="warning,electric_plug", priority="high")
+                        post_ntfy(msg, env, title="⚡ Rafmagnsleysi / Rafhlaða", tags="warning,electric_plug", priority="high", topic="kerfi")
                     else:
                         msg = f"✅ Rafmagn komst aftur á!\nSíminn er aftur í hleðslu ({cap}% staða)."
-                        post_ntfy(msg, env, title="🔌 Rafmagn komið á", tags="white_check_mark,zap", priority="default")
+                        post_ntfy(msg, env, title="🔌 Rafmagn komið á", tags="white_check_mark,zap", priority="default", topic="kerfi")
                     last_charger_state = charger_online
 
             temp_c = 0
@@ -1284,7 +1291,7 @@ def hardware_watchdog_loop() -> None:
                     pass
             if temp_c >= 45.0 and (time.time() - last_temp_alert_time > 1800):
                 msg = f"🔥 Hitaviðvörun á r8q símanum!\nHitastig rafhlöðu er komið í {temp_c:.1f}°C."
-                post_ntfy(msg, env, title="🔥 Hitaviðvörun", tags="fire,warning", priority="high")
+                post_ntfy(msg, env, title="🔥 Hitaviðvörun", tags="fire,warning", priority="high", topic="kerfi")
                 last_temp_alert_time = time.time()
 
         except Exception as exc:
@@ -1319,14 +1326,25 @@ def listen_loop() -> None:
                     title = data.get("title") or ""
                     tags = data.get("tags") or []
                     msg = (data.get("message") or "").strip()
+                    # Henda út tilkynningum frá vélmennum/kerfi eða tilkynningum með titli/merkjum
                     if (
                         "robot_face" in tags
+                        or "shield" in tags
+                        or "warning" in tags
+                        or "white_check_mark" in tags
+                        or "zap" in tags
+                        or "electric_plug" in tags
+                        or "package" in tags
+                        or "fire" in tags
                         or title.startswith("🤖")
                         or title.startswith("🛡️")
                         or title.startswith("⚡")
                         or title.startswith("📦")
-                        or "warning" in tags
-                        or "white_check_mark" in tags
+                        or title.startswith("🔌")
+                        or title.startswith("🔥")
+                        or title.startswith("🟢")
+                        or title.startswith("🚨")
+                        or title.startswith("⚠️")
                     ):
                         continue
                     if not msg:

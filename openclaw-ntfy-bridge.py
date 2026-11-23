@@ -170,8 +170,9 @@ def tool_inspect_lan_host(target: str = "") -> str:
         res["arp_error"] = str(e)
 
     ping_target = res["resolved_ips"][0] if res["resolved_ips"] else (target if re.match(r"^\d+\.\d+\.\d+\.\d+$", target) else None)
+    default_tablet_ip = env.get("TABLET_IP", "192.168.1.50")
     if not ping_target and any(k in target.lower() for k in ["tab", "spjald"]):
-        ping_target = "192.168.68.77"
+        ping_target = default_tablet_ip
 
     # Dýnamísk MAC-uppgötvun fyrir Galaxy Tab 4 (10:30:47:ea:d9:81) ef IP hefur breyst
     if any(k in target.lower() for k in ["tab", "spjald"]):
@@ -215,8 +216,9 @@ def tool_wake_device(target: str = "tab4.local") -> str:
         except Exception:
             pass
 
+    default_tablet_ip = env.get("TABLET_IP", "192.168.1.50")
     if not target_ip and any(k in target.lower() for k in ["tab", "spjald"]):
-        target_ip = "192.168.68.77"
+        target_ip = default_tablet_ip
 
     report["target_ip"] = target_ip
 
@@ -239,7 +241,7 @@ def tool_wake_device(target: str = "tab4.local") -> str:
     except Exception:
         pass
 
-    if not found_mac and (target_ip == "192.168.68.77" or any(k in target.lower() for k in ["tab", "spjald"])):
+    if not found_mac and (target_ip == default_tablet_ip or any(k in target.lower() for k in ["tab", "spjald"])):
         found_mac = "10:30:47:ea:d9:81"
 
     report["mac"] = found_mac
@@ -252,8 +254,9 @@ def tool_wake_device(target: str = "tab4.local") -> str:
         pkt = b"\xff" * 6 + mac_bytes * 16
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-            s.sendto(pkt, ("192.168.68.255", 9))
-            s.sendto(pkt, ("192.168.68.255", 7))
+            bcast = env.get("BROADCAST_IP", "<broadcast>")
+            s.sendto(pkt, (bcast if bcast != "<broadcast>" else "255.255.255.255", 9))
+            s.sendto(pkt, (bcast if bcast != "<broadcast>" else "255.255.255.255", 7))
         report["actions"].append(f"WoL Magic Packet sendur á útsendingarvistfang (broadcast) fyrir MAC {mac_to_use}.")
     except Exception as e:
         report["actions"].append(f"WoL villa: {e}")
@@ -794,19 +797,17 @@ def sanitize_for_external_llm(text: str) -> tuple[str, dict]:
         return token
     text = re.sub(r"\b[a-zA-Z0-9_\-]+\.tail[a-zA-Z0-9]+\.ts\.net(?::\d+)?\b", mask_tailnet, text)
 
-    # Þekkt heimilistæki og hýsingar
+    # Þekkt heimilistæki og hýsingar (lesið dýnamískt úr env ef til staðar, eða hreinsað)
     known_replacements = [
-        ("192.168.68.87", "<SERVER_IP>"),
-        ("192.168.68.77", "<TABLET_HOST>"),
-        ("192.168.68.75", "<TABLET_HOST>"),
-        ("192.168.68.1", "<ROUTER_IP>"),
+        (env.get("SERVER_LAN_IP", ""), "<SERVER_IP>"),
+        (env.get("TABLET_IP", ""), "<TABLET_HOST>"),
+        (env.get("ROUTER_IP", ""), "<ROUTER_IP>"),
         ("tab4.local", "<TABLET_HOST>"),
         ("tab4", "<TABLET_HOST>"),
         ("taba.local", "<TABLET_HOST>"),
         ("taba", "<TABLET_HOST>"),
-        ("10:30:47:ea:d9:81", "<TABLET_MAC>"),
-        ("1a:af:e7:49:41:25", "<TABLET_MAC>"),
     ]
+    known_replacements = [(orig, rep) for orig, rep in known_replacements if orig]
     for orig, rep in known_replacements:
         if orig.lower() in text.lower():
             mapping[rep] = orig
@@ -825,7 +826,7 @@ def sanitize_for_external_llm(text: str) -> tuple[str, dict]:
     def mask_lan_ip(m):
         nonlocal lan_ip_counter
         val = m.group(0)
-        if val in ("127.0.0.1", "0.0.0.0", "255.255.255.255", "192.168.68.255"):
+        if val in ("127.0.0.1", "0.0.0.0", "255.255.255.255") or val.endswith(".255"):
             return val
         for k, v in mapping.items():
             if v == val:

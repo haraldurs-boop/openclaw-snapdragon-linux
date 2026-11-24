@@ -1133,6 +1133,26 @@ def handle_confirm_update(env: dict) -> None:
         post_ntfy(f"⚠️ Villa við að virkja uppfærslu: {exc}", env, title="⚠️ Uppfærsluvilla", tags="warning", topic="kerfi")
 
 
+def queue_morning_alert(title: str, message: str, tags: str = "package", priority: str = "default", actions: str = "") -> bool:
+    """Vistar óbrýna tilkynningu í morgunbiðröð (/var/spool/antigravity-alerts) til kl. 07:00 / 09:30."""
+    spool_dir = "/var/spool/antigravity-alerts"
+    try:
+        os.makedirs(spool_dir, exist_ok=True)
+        fname = os.path.join(spool_dir, f"pending_triage_{int(time.time())}.json")
+        with open(fname, "w", encoding="utf-8") as f:
+            json.dump({
+                "title": title,
+                "message": message,
+                "tags": tags,
+                "priority": priority,
+                "actions": actions or None,
+            }, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception as exc:
+        print(f"[openclaw-triage] Gat ekki vistað í morgunbiðröð ({exc}), sendi strax.", flush=True)
+        return False
+
+
 def run_proactive_triage(payload: dict) -> None:
     """Framkvæmir staka, létta Proactive AI Triage greiningu á öryggisstöðu r8q og sendir ntfy með hnöppum."""
     import gc
@@ -1165,13 +1185,23 @@ def run_proactive_triage(payload: dict) -> None:
                     last_hash = f.read().strip()
                 if last_hash == triage_hash and not payload.get("force"):
                     print("[openclaw-triage] Sama triage_hash og síðast, sleppi Gemini kalli.", flush=True)
+                    urgency_rem = data.get("urgency", "normal")
+                    rem_actions = build_triage_actions(env)
+                    if urgency_rem != "urgent" and queue_morning_alert(
+                        "📦 Kerfisuppfærslur í bið",
+                        "ℹ️ Áminning: Uppfærslur bíða enn eftir staðfestingu á R8Q.",
+                        tags="package",
+                        priority="default",
+                        actions=rem_actions,
+                    ):
+                        return
                     post_ntfy(
                         "ℹ️ Áminning: Uppfærslur bíða enn eftir staðfestingu á R8Q.",
                         env,
                         title="📦 Kerfisuppfærslur í bið",
                         tags="package",
                         priority="default",
-                        actions=build_triage_actions(env),
+                        actions=rem_actions,
                         topic="kerfi"
                     )
                     return
@@ -1244,12 +1274,26 @@ def run_proactive_triage(payload: dict) -> None:
 
     actions = build_triage_actions(env)
     urgency = data.get("urgency", "normal")
+    triage_title = f"🛡️ OpenClaw: Öryggismat ({model_used})"
+    triage_tags = "shield,warning" if urgency == "urgent" else "shield,package"
+    triage_prio = "high" if urgency == "urgent" else "default"
+
+    if urgency != "urgent" and queue_morning_alert(
+        triage_title,
+        triage_text,
+        tags=triage_tags,
+        priority=triage_prio,
+        actions=actions,
+    ):
+        print(f"[openclaw-triage] Óbrýnt öryggismat vistað í morgunbiðröð ({model_used}).", flush=True)
+        return
+
     post_ntfy(
         triage_text,
         env,
-        title=f"🛡️ OpenClaw: Öryggismat ({model_used})",
-        tags="shield,warning" if urgency == "urgent" else "shield,package",
-        priority="high" if urgency == "urgent" else "default",
+        title=triage_title,
+        tags=triage_tags,
+        priority=triage_prio,
         actions=actions,
         topic="kerfi"
     )

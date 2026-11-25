@@ -1,0 +1,13 @@
+[Unit]
+Description=Set SCHED_FIFO priority 1 on rcu_preempt kthread
+DefaultDependencies=no
+After=local-fs.target
+Before=sysinit.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'for p in $(pgrep -x rcu_preempt); do chrt -f -p 1 "$p"; done'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=sysinit.target

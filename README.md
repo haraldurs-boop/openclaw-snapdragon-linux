@@ -98,6 +98,18 @@ This repository provides the complete post-mortem, system tuning rules, and a li
 * **The Problem:** Interactive notifications with HTTP Action buttons (`Actions: http, ...`) fail when constructed with loopback URLs (`http://127.0.0.1:2586`) because mobile clients cannot resolve `127.0.0.1` back to the server.
 * **The Mitigation:** Action buttons are dynamically routed through the server's public Tailscale Funnel endpoint (`PUBLIC_NTFY_URL`), allowing one-tap system triage and update triggers from Pixel/mobile devices on home Wi-Fi and 4G/5G LTE alike.
 
+### F. SM8250 Hardware Hardening: `max77705` IRQ Storm Fix & EPSS DVFS Lock
+*(Researched, diagnosed, and engineered in collaboration between [@haraldurs-boop](https://github.com/haraldurs-boop), **Google DeepMind Antigravity**, and **Gemini 4 Carbon / Neon**.)*
+
+1. **`max77705` `gpio11` `bias-pull-up` DTS Patch (Verified):**
+   * **The Problem:** In `sm8250-samsung-r8q.dts`, `pmic@66` (`maxim,max77705`) uses `IRQ_TYPE_LEVEL_LOW` on `pmic@4` `gpio11`, but `max77705-int-default-state` sets `bias-disable;`. Leaving the open-drain `INTB` line without a pull-up caused `gpio11` to float `LOW`, triggering a **300,001-interrupt storm** on `CPU 0` and >1,000,000 interrupts on `980000.i2c` within 3 minutes of boot until `spurious.c` killed `irq 173` (`nobody cared`).
+   * **The Fix:** Patch `bias-disable;` ➔ `bias-pull-up;` in `max77705-int-default-state`. On physical `r8q` hardware, `gpio11` changed from `in low ... no pull` to `in high ... pull-up 30uA`, `max77705` interrupts dropped from **300,001 to 1–3**, `980000.i2c` dropped by **98.4%**, and `nobody cared` disappeared completely.
+2. **Real-Time `rcu_preempt` Priority ([`rcu-prio.service`](rcu-prio.service)):**
+   * Elevates `rcu_preempt` to `SCHED_FIFO` priority `1` at early boot (`sysinit.target`) so background I2C/PCIe bursts cannot starve RCU grace-period processing.
+3. **EPSS DVFS Mid-OPP Lock ([`r8q-cpufreq-lock.service`](r8q-cpufreq-lock.service) & [`r8q-cpufreq-lock.sh`](r8q-cpufreq-lock.sh) — Active Long-Term Verification):**
+   * **The Problem:** Even with `cpuidle` `state1` disabled and `max77705` fixed, single cores (`CPU 1`, `CPU 3`, `CPU 6`) still occasionally hard-wedged inside `do_idle()` (`WFI`) and stopped responding to backtrace IPIs while `rcu_preempt` sat runnable (`state:R`) after remote timer migration. Periodic 20 ms wakeup hammers made the race worse (~34.5M transitions/day).
+   * **The Mitigation:** Disable 20 ms wakeup hammers and lock all three `qcom-cpufreq-hw` EPSS domains (`policy0`: `1171200`, `policy4`: `1478400`, `policy7`: `1632000` kHz, `performance` governor, `scaling_min_freq == scaling_max_freq`). Because `WFI` still gates core clocks, idle thermals remain unchanged (**37.4 °C** `mem-thermal`, **38.4 °C** A55) while eliminating 100% of EPSS voltage/frequency/L3 transitions. Currently under multi-day stability monitoring.
+
 ---
 
 ## 3. Quick Start & Deployment
